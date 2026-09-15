@@ -67,6 +67,8 @@ DUPLEX_MODE=$(ppd_value DeliDuplexMode) || DUPLEX_MODE=gs
 PAGESIZE=$(setting PageSize A4)
 RESOLUTION=$(setting Resolution 600dpi)
 DUPLEX=$(setting Duplex None)
+DENSITY=$(setting Density PrinterDefault)
+TONERSAVE=$(setting TonerSave PrinterDefault)
 
 GS=${DELI_GS:-gs}
 command -v "$GS" >/dev/null 2>&1 || {
@@ -146,7 +148,27 @@ case "$DUPLEX_MODE:$DUPLEX" in
     pcl5:DuplexTumble)   PCL5_DUPLEX=2 ;;
 esac
 
-log INFO "$PROG: device=$DEVICE paper=$PAGESIZE res=${XRES}x${YRES} duplex=$DUPLEX"
+# --- насыщенность печати -----------------------------------------------------
+#
+# Плотность и экономный режим живут не в растре, а в обвязке PJL, поэтому
+# Ghostscript до них не дотягивается. Команды пишутся в отдельный файл и
+# врезаются в готовый поток ниже. Пока обе настройки в PrinterDefault, в
+# поток не добавляется ничего — печать идёт ровно так, как настроена на
+# самом аппарате.
+
+PJL=$WORK/pjl.txt
+: > "$PJL"
+case "$DENSITY" in
+    Light)  printf '@PJL SET DENSITY=1\r\n' >> "$PJL" ;;
+    Normal) printf '@PJL SET DENSITY=3\r\n' >> "$PJL" ;;
+    Dark)   printf '@PJL SET DENSITY=5\r\n' >> "$PJL" ;;
+esac
+case "$TONERSAVE" in
+    True|On)   printf '@PJL SET ECONOMODE=ON\r\n' >> "$PJL" ;;
+    False|Off) printf '@PJL SET ECONOMODE=OFF\r\n' >> "$PJL" ;;
+esac
+
+log INFO "$PROG: device=$DEVICE paper=$PAGESIZE res=${XRES}x${YRES} duplex=$DUPLEX density=$DENSITY toner-save=$TONERSAVE"
 
 # Копии размножает pdftopdf выше по цепочке, здесь их трогать не нужно.
 
@@ -158,34 +180,58 @@ run_gs() {  # run_gs КУДА-ПИСАТЬ
           -sOutputFile="$1" "$INPUT"
 }
 
-if [ -n "$PCL5_DUPLEX" ]; then
-    # Ghostscript для ljet4 команду дуплекса не выдаёт вовсе, поэтому её
-    # вставляем сами сразу после сброса ESC E: ESC&l1S — переплёт по длинной
-    # стороне, ESC&l2S — по короткой.
+if [ -n "$PCL5_DUPLEX" ] || [ -s "$PJL" ]; then
+    # Что-то нужно врезать в готовый поток: команды PJL в самое начало и/или
+    # команду дуплекса после сброса ESC E, которую Ghostscript для ljet4 не
+    # выдаёт (ESC&l1S — переплёт по длинной стороне, ESC&l2S — по короткой).
     run_gs "$WORK/job.prn"
     status=$?
     if [ $status -eq 0 ]; then
-        python3 - "$PCL5_DUPLEX" "$WORK/job.prn" <<'PYDUP' || status=$?
+        python3 - "$WORK/job.prn" "${PCL5_DUPLEX:-}" "$PJL" <<'PYPOST' || status=$?
 import sys
 
-mode = sys.argv[1].encode("ascii")
+job, duplex, pjl_path = sys.argv[1], sys.argv[2], sys.argv[3]
+UEL = b"\x1b%-12345X"
+
+with open(pjl_path, "rb") as fh:
+    pjl = fh.read()
+
 out = sys.stdout.buffer
-with open(sys.argv[2], "rb") as src:
+added_header = False
+
+with open(job, "rb") as src:
     head = src.read(65536)
-    at = head.find(b"\x1bE")
-    if at < 0:
-        out.write(head)
-    else:
-        out.write(head[:at + 2])
-        out.write(b"\x1b&l" + mode + b"S")
-        out.write(head[at + 2:])
+
+    if pjl:
+        at = head.find(UEL)
+        if at >= 0:
+            # Ghostscript уже открыл поток UEL и своими @PJL — встраиваемся
+            # сразу за ним, до строки @PJL ENTER LANGUAGE.
+            cut = at + len(UEL)
+            head = head[:cut] + pjl + head[cut:]
+        else:
+            # Чистый PCL5 без обвязки: заводим её сами. Сброс ESC E,
+            # который идёт дальше, настройки PJL не отменяет.
+            head = UEL + b"@PJL\r\n" + pjl + b"@PJL ENTER LANGUAGE=PCL\r\n" + head
+            added_header = True
+
+    if duplex:
+        at = head.find(b"\x1bE")
+        if at >= 0:
+            cut = at + 2
+            head = head[:cut] + b"\x1b&l" + duplex.encode("ascii") + b"S" + head[cut:]
+
+    out.write(head)
     while True:
         chunk = src.read(1 << 20)
         if not chunk:
             break
         out.write(chunk)
+
+if added_header:
+    out.write(UEL)
 out.flush()
-PYDUP
+PYPOST
     fi
 else
     run_gs -

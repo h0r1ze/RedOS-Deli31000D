@@ -20,6 +20,8 @@ emit() {
 *% Задание готовит Ghostscript устройством $device, его вызывает фильтр
 *% deli-rasterize. Файл создан ppd/make-ppds.sh — правьте генератор, не PPD.
 *%
+*% Плотность и экономный режим Ghostscript не умеет — фильтр выдаёт их
+*% командами PJL. Пока стоит PrinterDefault, в поток не добавляется ничего.
 *% Ярлыки пунктов оставлены латиницей: CUPS разбирает их как ISOLatin1.
 *% Какой из трёх вариантов ваш, показывает поле CMD: в строке Device ID:
 *% tools/deli-devid.py. Подробности — docs/02-printing.md.
@@ -123,6 +125,23 @@ emit() {
 *Duplex DuplexNoTumble/Long Edge (Standard): "<</Duplex true/Tumble false>>setpagedevice"
 *Duplex DuplexTumble/Short Edge (Flip): "<</Duplex true/Tumble true>>setpagedevice"
 *CloseUI: *Duplex
+
+*OpenUI *Density/Print Density: PickOne
+*OrderDependency: 40 AnySetup *Density
+*DefaultDensity: PrinterDefault
+*Density PrinterDefault/Printer Setting: ""
+*Density Light/Light: ""
+*Density Normal/Normal: ""
+*Density Dark/Dark: ""
+*CloseUI: *Density
+
+*OpenUI *TonerSave/Toner Save (EconoMode): PickOne
+*OrderDependency: 41 AnySetup *TonerSave
+*DefaultTonerSave: PrinterDefault
+*TonerSave PrinterDefault/Printer Setting: ""
+*TonerSave False/Off: ""
+*TonerSave True/On: ""
+*CloseUI: *TonerSave
 
 *CloseGroup: General
 EOF
