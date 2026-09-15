@@ -126,6 +126,19 @@ fi
 
 systemctl is-active --quiet cups 2>/dev/null || systemctl start cups 2>/dev/null
 
+# Очередь с таким именем может уже существовать — тогда lpadmin не создаст
+# вторую, а заменит драйвер у прежней. Сохраняем её PPD, чтобы было куда
+# вернуться.
+EXISTING=/etc/cups/ppd/$NAME.ppd
+if [ -r "$EXISTING" ] && ! grep -q deli-rasterize "$EXISTING" 2>/dev/null; then
+    BACKUP=$EXISTING.before-deli-$(date +%Y%m%d-%H%M%S)
+    cp -a "$EXISTING" "$BACKUP"
+    echo "Очередь $NAME уже есть, и драйвер у неё другой."
+    echo "Прежний PPD сохранён: $BACKUP"
+    echo "Вернуть его обратно:  sudo ./rollback.sh --yes --restore-ppd $BACKUP"
+    echo
+fi
+
 lpadmin -p "$NAME" -v "$URI" -P "$MODELDIR/Deli-M3100D-$PDL.ppd" -E \
         -o printer-is-shared=false || exit 1
 cupsenable "$NAME" 2>/dev/null
