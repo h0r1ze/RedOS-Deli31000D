@@ -1,0 +1,270 @@
+Поддержка Deli M3100D в pantum-open
+
+Патч к https://github.com/loss-and-quick/pantum-open
+базовый коммит: cd25c1d4e97447af162e24af5aa931fd31c85903
+Лицензия проекта и патча: GPL-2.0-or-later.
+
+Что делает:
+  * добавляет USB-идентификатор 300e:10c4 (Deli M3100D) в pantum.conf
+    и в правила udev проекта;
+  * перестаёт считать, что сканер всегда сидит на интерфейсе 1 с
+    эндпоинтами 0x02/0x82. У Pantum M6507 это так, но у Deli интерфейс
+    принтера — первый (CUPS показывает usb://Deli/M3100D?...&interface=1),
+    значит сканер на другом номере. Теперь backend ищет в дескрипторе
+    конфигурации vendor-специфичный интерфейс с парой bulk-эндпоинтов и
+    занимает именно его, а прежние константы остались запасным вариантом.
+
+Применять так:
+    git clone https://github.com/loss-and-quick/pantum-open
+    cd pantum-open && git checkout cd25c1d4e97447af162e24af5aa931fd31c85903
+    git apply /путь/к/0001-deli-m3100d.patch
+(ровно это делает ../../install-scanner.sh)
+
+diff --git a/etc/sane.d/pantum.conf b/etc/sane.d/pantum.conf
+index 7e36d9d..cf8b4e4 100644
+--- a/etc/sane.d/pantum.conf
++++ b/etc/sane.d/pantum.conf
+@@ -9,3 +9,4 @@ usb 0x232b 0x1e20 M6500N
+ usb 0x232b 0x7e20 M6500W
+ usb 0x232b 0x2e20 M6500NW
+ usb 0x232b 0x086d M6507N
++usb 0x300e 0x10c4 Deli M3100D
+diff --git a/etc/udev/rules.d/60-pantum-open.rules b/etc/udev/rules.d/60-pantum-open.rules
+index ba7cf87..28b3329 100644
+--- a/etc/udev/rules.d/60-pantum-open.rules
++++ b/etc/udev/rules.d/60-pantum-open.rules
+@@ -19,5 +19,6 @@ ATTR{idVendor}=="232b", ATTR{idProduct}=="1e20", MODE="0664", GROUP="scanner", E
+ ATTR{idVendor}=="232b", ATTR{idProduct}=="7e20", MODE="0664", GROUP="scanner", ENV{libsane_matched}="yes"
+ ATTR{idVendor}=="232b", ATTR{idProduct}=="2e20", MODE="0664", GROUP="scanner", ENV{libsane_matched}="yes"
+ ATTR{idVendor}=="232b", ATTR{idProduct}=="086d", MODE="0664", GROUP="scanner", ENV{libsane_matched}="yes"
++ATTR{idVendor}=="300e", ATTR{idProduct}=="10c4", MODE="0664", GROUP="scanner", ENV{libsane_matched}="yes"
+ 
+ LABEL="pantum_open_end"
+diff --git a/src/pantum.c b/src/pantum.c
+index e4c2d2f..44796aa 100644
+--- a/src/pantum.c
++++ b/src/pantum.c
+@@ -39,10 +39,6 @@
+ /* Non-blocking mode only ever glances at the endpoint. */
+ #define TIMEOUT_POLL 20
+ 
+-/* Bulk endpoints of the scanner interface. */
+-#define EP_OUT 0x02
+-#define EP_IN 0x82
+-
+ #define MM_PER_UNIT 0.254 /* one hundredth of an inch */
+ #define MM_PER_INCH 25.4
+ 
+@@ -509,13 +505,13 @@ usb_write (Pantum_Handle *h, const void *buf, size_t len)
+         {
+           /* libusb takes one buffer type for both directions and does not
+            * write to it on an OUT transfer, hence the cast away from const. */
+-          rc = libusb_bulk_transfer (h->usb, EP_OUT, (unsigned char *)p + done,
++          rc = libusb_bulk_transfer (h->usb, h->ep_out, (unsigned char *)p + done,
+                                      (int)(len - done), &transferred,
+                                      TIMEOUT_WRITE);
+           if (rc == LIBUSB_SUCCESS || rc == LIBUSB_ERROR_TIMEOUT)
+             break;
+           DBG (1, "bulk out failed: %s, retrying\n", libusb_error_name (rc));
+-          libusb_clear_halt (h->usb, EP_OUT);
++          libusb_clear_halt (h->usb, h->ep_out);
+           sleep_ms (10);
+         }
+       if (rc != LIBUSB_SUCCESS || transferred <= 0)
+@@ -544,13 +540,13 @@ usb_read (Pantum_Handle *h, void *buf, size_t len, unsigned timeout)
+ 
+       for (tries = 0; tries < 3; tries++)
+         {
+-          rc = libusb_bulk_transfer (h->usb, EP_IN, p + done,
++          rc = libusb_bulk_transfer (h->usb, h->ep_in, p + done,
+                                      (int)(len - done), &transferred,
+                                      timeout);
+           if (rc == LIBUSB_SUCCESS || rc == LIBUSB_ERROR_TIMEOUT)
+             break;
+           DBG (1, "bulk in failed: %s, retrying\n", libusb_error_name (rc));
+-          libusb_clear_halt (h->usb, EP_IN);
++          libusb_clear_halt (h->usb, h->ep_in);
+           sleep_ms (10);
+         }
+       if (rc != LIBUSB_SUCCESS || transferred <= 0)
+@@ -576,7 +572,7 @@ flush_input (Pantum_Handle *h)
+   for (i = 0; i < 4096; i++)
+     {
+       int transferred = 0;
+-      int rc = libusb_bulk_transfer (h->usb, EP_IN, scratch, sizeof (scratch),
++      int rc = libusb_bulk_transfer (h->usb, h->ep_in, scratch, sizeof (scratch),
+                                      &transferred, 200);
+       if (rc != LIBUSB_SUCCESS || transferred <= 0)
+         break;
+@@ -621,7 +617,7 @@ recv_frame (Pantum_Handle *h, Pantum_Frame *f, unsigned timeout,
+   if (probe)
+     {
+       int transferred = 0;
+-      int rc = libusb_bulk_transfer (h->usb, EP_IN, buf, sizeof (buf),
++      int rc = libusb_bulk_transfer (h->usb, h->ep_in, buf, sizeof (buf),
+                                      &transferred, TIMEOUT_POLL);
+ 
+       if (rc != LIBUSB_SUCCESS && rc != LIBUSB_ERROR_TIMEOUT)
+@@ -1856,7 +1852,7 @@ free_handle (Pantum_Handle *h)
+   free (h->raw);
+   if (h->usb)
+     {
+-      libusb_release_interface (h->usb, PANTUM_INTERFACE);
++      libusb_release_interface (h->usb, h->iface);
+       libusb_close (h->usb);
+     }
+   if (h->dev)
+@@ -1957,6 +1953,71 @@ sane_pantum_get_devices (const SANE_Device ***device_list_out,
+   return SANE_STATUS_GOOD;
+ }
+ 
++/* Locate the scanner: the first vendor-specific interface that has a pair of
++ * bulk endpoints, and those endpoints.  The M6507 answers with interface 1
++ * and 0x02/0x82, which is what the compiled-in fallback says, but rebadged
++ * units of the same family number their interfaces the other way round, so
++ * the descriptor is the only reliable source.  A device that has no such
++ * interface at all is left to the fallback and will simply fail to talk. */
++static void
++find_scan_interface (libusb_device *dev, int *iface, unsigned char *ep_in,
++                     unsigned char *ep_out)
++{
++  struct libusb_config_descriptor *cfg;
++  int i, a, e, rc;
++
++  *iface = PANTUM_INTERFACE;
++  *ep_in = PANTUM_EP_IN;
++  *ep_out = PANTUM_EP_OUT;
++
++  rc = libusb_get_active_config_descriptor (dev, &cfg);
++  if (rc != LIBUSB_SUCCESS)
++    {
++      DBG (1, "config descriptor: %s, assuming interface %d\n",
++           libusb_error_name (rc), *iface);
++      return;
++    }
++
++  for (i = 0; i < cfg->bNumInterfaces; i++)
++    for (a = 0; a < cfg->interface[i].num_altsetting; a++)
++      {
++        const struct libusb_interface_descriptor *id
++            = &cfg->interface[i].altsetting[a];
++        unsigned char in = 0, out = 0;
++
++        if (id->bInterfaceClass != LIBUSB_CLASS_VENDOR_SPEC)
++          continue;
++        for (e = 0; e < id->bNumEndpoints; e++)
++          {
++            const struct libusb_endpoint_descriptor *ep = &id->endpoint[e];
++
++            if ((ep->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK)
++                != LIBUSB_TRANSFER_TYPE_BULK)
++              continue;
++            if (ep->bEndpointAddress & LIBUSB_ENDPOINT_IN)
++              {
++                if (!in)
++                  in = ep->bEndpointAddress;
++              }
++            else if (!out)
++              out = ep->bEndpointAddress;
++          }
++        if (in && out)
++          {
++            *iface = id->bInterfaceNumber;
++            *ep_in = in;
++            *ep_out = out;
++            DBG (2, "scanner on interface %d, endpoints 0x%02x in 0x%02x out\n",
++                 *iface, *ep_in, *ep_out);
++            libusb_free_config_descriptor (cfg);
++            return;
++          }
++      }
++
++  libusb_free_config_descriptor (cfg);
++  DBG (1, "no vendor-specific bulk interface, assuming interface %d\n", *iface);
++}
++
+ SANE_Status
+ sane_pantum_open (SANE_String_Const devicename, SANE_Handle *handle)
+ {
+@@ -1965,6 +2026,8 @@ sane_pantum_open (SANE_String_Const devicename, SANE_Handle *handle)
+   libusb_device **devs;
+   libusb_device_handle *usb = NULL;
+   ssize_t count, i;
++  int iface = PANTUM_INTERFACE;
++  unsigned char ep_in = PANTUM_EP_IN, ep_out = PANTUM_EP_OUT;
+   int rc;
+ 
+   if (!initialised || !handle)
+@@ -2002,6 +2065,7 @@ sane_pantum_open (SANE_String_Const devicename, SANE_Handle *handle)
+       if (libusb_get_bus_number (devs[i]) != d->bus
+           || libusb_get_device_address (devs[i]) != d->addr)
+         continue;
++      find_scan_interface (devs[i], &iface, &ep_in, &ep_out);
+       rc = libusb_open (devs[i], &usb);
+       if (rc != LIBUSB_SUCCESS)
+         {
+@@ -2016,12 +2080,12 @@ sane_pantum_open (SANE_String_Const devicename, SANE_Handle *handle)
+   if (!usb)
+     return SANE_STATUS_IO_ERROR;
+ 
+-  /* Claim only the scanner interface: interface 0 is the printer and is in
++  /* Claim only the scanner interface: the other one is the printer and is in
+    * use by usblp/CUPS.  The configuration is left alone for the same reason. */
+-  rc = libusb_claim_interface (usb, PANTUM_INTERFACE);
++  rc = libusb_claim_interface (usb, iface);
+   if (rc != LIBUSB_SUCCESS)
+     {
+-      DBG (1, "claim interface %d: %s\n", PANTUM_INTERFACE,
++      DBG (1, "claim interface %d: %s\n", iface,
+            libusb_error_name (rc));
+       libusb_close (usb);
+       return rc == LIBUSB_ERROR_BUSY ? SANE_STATUS_DEVICE_BUSY
+@@ -2031,12 +2095,15 @@ sane_pantum_open (SANE_String_Const devicename, SANE_Handle *handle)
+   h = calloc (1, sizeof (*h));
+   if (!h)
+     {
+-      libusb_release_interface (usb, PANTUM_INTERFACE);
++      libusb_release_interface (usb, iface);
+       libusb_close (usb);
+       return SANE_STATUS_NO_MEM;
+     }
+   h->dev = d;
+   h->usb = usb;
++  h->iface = iface;
++  h->ep_in = ep_in;
++  h->ep_out = ep_out;
+   flush_input (h);
+   /* Ask before building the option list: a unit without a feeder must not
+    * advertise one. */
+diff --git a/src/pantum.h b/src/pantum.h
+index 34f3529..4eaa90b 100644
+--- a/src/pantum.h
++++ b/src/pantum.h
+@@ -15,9 +15,15 @@
+ #include <libusb.h>
+ #include <sane/sane.h>
+ 
+-/* The scanner lives on interface 1; interface 0 is the printer and belongs
+- * to usblp, so it must never be claimed here. */
++/* Where the scanner sits when the configuration descriptor cannot be read.
++ * On a Pantum M6507 it is interface 1 with bulk 0x02/0x82; interface 0 is the
++ * printer and belongs to usblp, so it must never be claimed here.  Rebadged
++ * units of the same family renumber the pair - the Deli M3100D carries the
++ * printer class interface on 1 and the scanner on 0 - so these are only a
++ * fallback, and find_scan_interface() looks the real numbers up. */
+ #define PANTUM_INTERFACE 1
++#define PANTUM_EP_OUT 0x02
++#define PANTUM_EP_IN 0x82
+ 
+ #define PANTUM_MAGIC 0x41535001u /* "ASP\x01" */
+ #define PANTUM_HEADER_LEN 32
+@@ -135,6 +141,9 @@ typedef struct Pantum_Handle
+   struct Pantum_Handle *next;
+   Pantum_Device *dev;
+   libusb_device_handle *usb;
++  int iface;             /* vendor-specific interface claimed for scanning */
++  unsigned char ep_out;  /* its bulk out endpoint */
++  unsigned char ep_in;   /* its bulk in endpoint */
+ 
+   SANE_Option_Descriptor opt[NUM_OPTIONS];
+   Option_Value val[NUM_OPTIONS];
