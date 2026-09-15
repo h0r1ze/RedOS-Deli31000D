@@ -1,0 +1,198 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Фильтр CUPS для Deli M3100D: PDF -> язык принтера силами Ghostscript.
+#
+# CUPS вызывает фильтр как
+#     deli-rasterize job user title copies options [файл]
+# и ждёт готовое задание на stdout.  Какой язык печати собирать, сказано в
+# самом PPD строкой  *DeliGSDevice: "pxlmono"  — так один фильтр обслуживает
+# все три варианта PPD (PCL-XL, PCL5e, PostScript).
+#
+# Отладить без очереди печати можно так:
+#     PPD=ppd/Deli-M3100D-pclxl.ppd filter/deli-rasterize 1 user test 1 "" x.pdf > out.prn
+#     cat out.prn > /dev/usb/lp0
+
+set -u
+
+PROG=$(basename "$0")
+log() { printf '%s: %s\n' "$1" "$2" >&2; }
+
+if [ $# -lt 5 ]; then
+    log ERROR "$PROG: ожидались аргументы job user title copies options [file]"
+    exit 1
+fi
+
+OPTIONS=$5
+INPUT=${6:-}
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/deli-rasterize.XXXXXX") || exit 1
+trap 'rm -rf "$WORK"' EXIT HUP INT TERM
+
+if [ -z "$INPUT" ]; then
+    INPUT=$WORK/input.pdf
+    cat > "$INPUT" || exit 1
+fi
+[ -s "$INPUT" ] || { log INFO "$PROG: пустое задание, печатать нечего"; exit 0; }
+
+# --- то, что сказано в PPD ---------------------------------------------------
+
+ppd_value() {
+    [ -n "${PPD:-}" ] && [ -r "${PPD:-}" ] || return 1
+    sed -n "s/^\*$1:[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*$/\1/p" "$PPD" \
+        | head -1
+}
+
+# --- то, что пришло в задании ------------------------------------------------
+
+opt_value() {
+    for kv in $OPTIONS; do
+        case "$kv" in
+            "$1"=*) printf '%s\n' "${kv#*=}"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+setting() {  # setting ИМЯ-ОПЦИИ ЗАПАСНОЕ-ЗНАЧЕНИЕ
+    value=$(opt_value "$1") && [ -n "$value" ] && { printf '%s\n' "$value"; return 0; }
+    value=$(ppd_value "Default$1") && [ -n "$value" ] && { printf '%s\n' "$value"; return 0; }
+    printf '%s\n' "$2"
+}
+
+DEVICE=$(ppd_value DeliGSDevice) || DEVICE=""
+[ -n "$DEVICE" ] || DEVICE=pxlmono
+DUPLEX_MODE=$(ppd_value DeliDuplexMode) || DUPLEX_MODE=gs
+[ -n "$DUPLEX_MODE" ] || DUPLEX_MODE=gs
+PAGESIZE=$(setting PageSize A4)
+RESOLUTION=$(setting Resolution 600dpi)
+DUPLEX=$(setting Duplex None)
+
+GS=${DELI_GS:-gs}
+command -v "$GS" >/dev/null 2>&1 || {
+    log ERROR "$PROG: Ghostscript не найден, установите пакет ghostscript"
+    exit 1
+}
+
+gs_has_device() {
+    "$GS" -dQUIET -dBATCH -dNOPAUSE -sDEVICE="$1" -sOutputFile=/dev/null \
+          -c quit >/dev/null 2>&1
+}
+
+if ! gs_has_device "$DEVICE"; then
+    log ERROR "$PROG: Ghostscript не умеет устройство $DEVICE"
+    for alt in ljet4 pxlmono ps2write; do
+        if gs_has_device "$alt"; then
+            log INFO "$PROG: беру $alt вместо $DEVICE"
+            DEVICE=$alt
+            [ "$alt" = ljet4 ] && DUPLEX_MODE=pcl5
+            break
+        fi
+    done
+    gs_has_device "$DEVICE" || exit 1
+fi
+
+# --- разрешение --------------------------------------------------------------
+
+RES=$(printf '%s' "$RESOLUTION" | sed 's/dpi$//')
+case "$RES" in
+    *x*) XRES=${RES%x*}; YRES=${RES#*x} ;;
+    *)   XRES=$RES; YRES=$RES ;;
+esac
+case "$XRES$YRES" in
+    *[!0-9]*|"") XRES=600; YRES=600 ;;
+esac
+
+# --- размер бумаги -----------------------------------------------------------
+
+set --  # сюда собираются аргументы бумаги для Ghostscript
+case "$PAGESIZE" in
+    Custom.*)
+        dims=${PAGESIZE#Custom.}
+        width=$(printf '%s' "${dims%%x*}" | sed 's/[a-zA-Z]*$//')
+        height=$(printf '%s' "${dims#*x}" | sed 's/[a-zA-Z]*$//')
+        if [ -n "$width" ] && [ -n "$height" ]; then
+            set -- -dDEVICEWIDTHPOINTS="$width" -dDEVICEHEIGHTPOINTS="$height" -dFIXEDMEDIA
+        else
+            set -- -sPAPERSIZE=a4 -dFIXEDMEDIA
+        fi
+        ;;
+    *)
+        case "$PAGESIZE" in
+            A4)        paper=a4 ;;
+            Letter)    paper=letter ;;
+            Legal)     paper=legal ;;
+            A5)        paper=a5 ;;
+            A6)        paper=a6 ;;
+            B5|JISB5)  paper=jisb5 ;;
+            ISOB5)     paper=isob5 ;;
+            Executive) paper=executive ;;
+            *)         paper=a4
+                       log INFO "$PROG: размер $PAGESIZE неизвестен, печатаю на A4" ;;
+        esac
+        set -- -sPAPERSIZE="$paper" -dFIXEDMEDIA
+        ;;
+esac
+PAPER_ARGS=$*
+
+# --- двусторонняя печать -----------------------------------------------------
+
+DUPLEX_ARGS=""
+PCL5_DUPLEX=""
+case "$DUPLEX_MODE:$DUPLEX" in
+    gs:DuplexNoTumble)   DUPLEX_ARGS="-dDuplex=true -dTumble=false" ;;
+    gs:DuplexTumble)     DUPLEX_ARGS="-dDuplex=true -dTumble=true" ;;
+    pcl5:DuplexNoTumble) PCL5_DUPLEX=1 ;;
+    pcl5:DuplexTumble)   PCL5_DUPLEX=2 ;;
+esac
+
+log INFO "$PROG: device=$DEVICE paper=$PAGESIZE res=${XRES}x${YRES} duplex=$DUPLEX"
+
+# Копии размножает pdftopdf выше по цепочке, здесь их трогать не нужно.
+
+run_gs() {  # run_gs КУДА-ПИСАТЬ
+    # shellcheck disable=SC2086
+    "$GS" -dQUIET -dBATCH -dNOPAUSE -dSAFER -dNOINTERPOLATE \
+          -sDEVICE="$DEVICE" -r"${XRES}x${YRES}" \
+          $PAPER_ARGS -dPDFFitPage $DUPLEX_ARGS \
+          -sOutputFile="$1" "$INPUT"
+}
+
+if [ -n "$PCL5_DUPLEX" ]; then
+    # Ghostscript для ljet4 команду дуплекса не выдаёт вовсе, поэтому её
+    # вставляем сами сразу после сброса ESC E: ESC&l1S — переплёт по длинной
+    # стороне, ESC&l2S — по короткой.
+    run_gs "$WORK/job.prn"
+    status=$?
+    if [ $status -eq 0 ]; then
+        python3 - "$PCL5_DUPLEX" "$WORK/job.prn" <<'PYDUP' || status=$?
+import sys
+
+mode = sys.argv[1].encode("ascii")
+out = sys.stdout.buffer
+with open(sys.argv[2], "rb") as src:
+    head = src.read(65536)
+    at = head.find(b"\x1bE")
+    if at < 0:
+        out.write(head)
+    else:
+        out.write(head[:at + 2])
+        out.write(b"\x1b&l" + mode + b"S")
+        out.write(head[at + 2:])
+    while True:
+        chunk = src.read(1 << 20)
+        if not chunk:
+            break
+        out.write(chunk)
+out.flush()
+PYDUP
+    fi
+else
+    run_gs -
+    status=$?
+fi
+
+if [ $status -ne 0 ]; then
+    log ERROR "$PROG: Ghostscript завершился с кодом $status"
+fi
+exit $status

@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Права на сканирующую половину Deli M3100D (USB 300e:10c4).
+#
+# Без этого правила /dev/bus/usb/... принадлежит root, и SANE-backend,
+# запущенный от пользователя, до сканера не достучится. Метка
+# libsane_matched — то, как backend заявляет права на устройство: штатные
+# правила sane-backends по ней выдают доступ вошедшему в систему
+# пользователю через uaccess.
+#
+# Установка:
+#   cp sane/99-deli-m3100d.rules /etc/udev/rules.d/
+#   udevadm control --reload && udevadm trigger
+# (это делает install-scanner.sh)
+
+ACTION!="add", GOTO="deli_m3100d_end"
+SUBSYSTEM!="usb", GOTO="deli_m3100d_end"
+ENV{DEVTYPE}!="usb_device", GOTO="deli_m3100d_end"
+
+ATTR{idVendor}=="300e", ATTR{idProduct}=="10c4", MODE="0664", GROUP="scanner", ENV{libsane_matched}="yes"
+
+LABEL="deli_m3100d_end"
